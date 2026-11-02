@@ -1,0 +1,371 @@
+{
+  "name": "WF-01 - Data Ingestion",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        304
+      ],
+      "id": "35f0fc54-03e3-4265-ae0f-e198251ad11b",
+      "name": "Manual Trigger - Start Ingestion"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.2,
+      "position": [
+        1120,
+        304
+      ],
+      "id": "e0f80669-d965-4f47-9daf-ca12dfef3b25",
+      "name": "Extract  CSV Records"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nconst batchId = $('Create Ingestion Batch').first().json.batch_id;\n\nfunction cleanString(value) {\n    if (value === null || value === undefined) {\n        return null;\n    }\n\n    const cleaned = String(value).trim();\n    return cleaned === \"\" ? null : cleaned;\n}\n\nfunction parseNumber(value) {\n    if (value === null || value === undefined || String(value).trim() === \"\") {\n        return null;\n    }\n\n    const parsed = Number(value);\n    return Number.isFinite(parsed) ? parsed : null;\n}\n\nfunction isValidDateTime(value) {\n    if (typeof value !== \"string\") {\n        return false;\n    }\n\n    const match = value.match(\n        /^(\\d{4})-(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})$/\n    );\n\n    if (!match) {\n        return false;\n    }\n\n    const [, year, month, day, hour, minute, second] = match.map(Number);\n\n    const date = new Date(\n        Date.UTC(year, month - 1, day, hour, minute, second)\n    );\n\n    return (\n        date.getUTCFullYear() === year &&\n        date.getUTCMonth() === month - 1 &&\n        date.getUTCDate() === day &&\n        date.getUTCHours() === hour &&\n        date.getUTCMinutes() === minute &&\n        date.getUTCSeconds() === second\n    );\n}\n\nfunction normalizeAndValidate(raw) {\n    const sourceRowNumber = parseNumber(raw.SourceRowNumber);\n    const invoiceNo = cleanString(raw.InvoiceNo);\n    const stockCode = cleanString(raw.StockCode);\n    const description = cleanString(raw.Description);\n    const quantity = parseNumber(raw.Quantity);\n    const invoiceDate = cleanString(raw.InvoiceDate);\n    const unitPrice = parseNumber(raw.UnitPrice);\n    const customerId = cleanString(raw.CustomerID);\n    const country = cleanString(raw.Country);\n\n    const errors = [];\n\n    if (\n        sourceRowNumber === null ||\n        !Number.isInteger(sourceRowNumber) ||\n        sourceRowNumber <= 0\n    ) {\n        errors.push(\"Invalid source row number\");\n    }\n\n    if (!invoiceNo) errors.push(\"Missing invoice number\");\n    if (!stockCode) errors.push(\"Missing stock code\");\n    if (!country) errors.push(\"Missing country\");\n\n    if (quantity === null || !Number.isInteger(quantity)) {\n        errors.push(\"Invalid quantity\");\n    } else if (quantity === 0) {\n        errors.push(\"Quantity cannot be zero\");\n    }\n\n    if (!isValidDateTime(invoiceDate)) {\n        errors.push(\"Invalid invoice date\");\n    }\n\n    if (unitPrice === null) {\n        errors.push(\"Invalid unit price\");\n    } else if (unitPrice < 0) {\n        errors.push(\"Unit price cannot be negative\");\n    }\n\n    const isCancellation = Boolean(\n        invoiceNo?.startsWith(\"C\") || (quantity !== null && quantity < 0)\n    );\n\n    return {\n        is_valid: errors.length === 0,\n        batch_id: batchId,\n\n        source_row_number: sourceRowNumber,\n\n        invoice_no: invoiceNo,\n        stock_code: stockCode,\n        description,\n        quantity,\n        invoice_date: invoiceDate,\n        unit_price: unitPrice,\n        customer_id: customerId,\n        country,\n\n        is_cancellation: isCancellation,\n        has_missing_description: description === null,\n        has_missing_customer_id: customerId === null,\n        has_zero_unit_price: unitPrice === 0,\n\n        raw_record: raw,\n        rejection_reason: errors.length > 0\n            ? errors.join(\"; \")\n            : null,\n    };\n}\n\nreturn items.map(item => ({\n    json: normalizeAndValidate(item.json),\n}));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        304
+      ],
+      "id": "e6bb198c-a36c-4c73-9e1d-a4671b6f0782",
+      "name": "Normalize & Validate Records"
+    },
+    {
+      "parameters": {
+        "binaryData": true,
+        "dataPropertyName": "file_hash"
+      },
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        448,
+        304
+      ],
+      "id": "f7298560-a4fe-4581-947c-011e53dbb1c4",
+      "name": "Calculate File SHA256"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO ingestion_batches (\n    source_file,\n    file_hash,\n    status\n)\nVALUES ($1, $2, 'processing')\nON CONFLICT (file_hash)\n    WHERE status IN ('processing', 'completed')\nDO NOTHING\nRETURNING\n    batch_id::text AS batch_id,\n    source_file,\n    file_hash,\n    status,\n    started_at;",
+        "options": {
+          "queryBatching": "single",
+          "queryReplacement": "={{ ['online_retail_sample.csv', $json.file_hash] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        672,
+        304
+      ],
+      "id": "7fcd938c-46a8-482b-91f4-bbb7d19994d1",
+      "name": "Create Ingestion Batch",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fileSelector": "/files/samples/online_retail_sample.csv",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        224,
+        304
+      ],
+      "id": "af12c663-d8e3-4be7-acd0-67169dbf8d15",
+      "name": "Read Sample CSV - Hash"
+    },
+    {
+      "parameters": {
+        "fileSelector": "/files/samples/online_retail_sample.csv",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        896,
+        304
+      ],
+      "id": "40192492-b8a9-4745-9278-5a1e2f933372",
+      "name": "Read Sample CSV - Extract "
+    },
+    {
+      "parameters": {
+        "jsCode": "const records = $input.all()\n    .map(item => item.json)\n    .filter(r => r.is_valid)\n    .map(r => ({\n        batch_id: r.batch_id,\n        source_row_number: r.source_row_number,\n        invoice_no: r.invoice_no,\n        stock_code: r.stock_code,\n        description: r.description,\n        quantity: r.quantity,\n        invoice_date: r.invoice_date,\n        unit_price: r.unit_price,\n        customer_id: r.customer_id,\n        country: r.country,\n    }));\n\nif (records.length === 0) {\n    return [{ json: { rows: [] } }];\n}\n\nconst BATCH_SIZE = 500;\nconst batches = [];\n\nfor (let i = 0; i < records.length; i += BATCH_SIZE) {\n    batches.push(records.slice(i, i + BATCH_SIZE));\n}\n\nreturn batches.map(rows => ({ json: { rows } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        208
+      ],
+      "id": "eaac889d-c905-414e-b29b-1055b019a03e",
+      "name": "Prepare Valid Transaction Batches"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH inserted AS (\n    INSERT INTO sales_transactions (\n        batch_id,\n        source_row_number,\n        invoice_no,\n        stock_code,\n        description,\n        quantity,\n        invoice_date,\n        unit_price,\n        customer_id,\n        country\n    )\n    SELECT\n        r.batch_id,\n        r.source_row_number,\n        r.invoice_no,\n        r.stock_code,\n        r.description,\n        r.quantity,\n        r.invoice_date,\n        r.unit_price,\n        r.customer_id,\n        r.country\n    FROM jsonb_to_recordset($1::jsonb) AS r (\n        batch_id UUID,\n        source_row_number INTEGER,\n        invoice_no VARCHAR(20),\n        stock_code VARCHAR(50),\n        description TEXT,\n        quantity INTEGER,\n        invoice_date TIMESTAMP,\n        unit_price NUMERIC(12, 4),\n        customer_id VARCHAR(30),\n        country VARCHAR(100)\n    )\n    ON CONFLICT (batch_id, source_row_number)\n    DO NOTHING\n    RETURNING 1\n)\nSELECT COUNT(*)::INTEGER AS inserted_records\nFROM inserted;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{ [JSON.stringify($json.rows)] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        1792,
+        208
+      ],
+      "id": "44870d00-7db7-4440-ba1d-1256f5809c27",
+      "name": "Insert Sales Transactions",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const records = $input.all()\n    .map(item => item.json)\n    .filter(r => !r.is_valid)\n    .map(r => ({\n        batch_id: r.batch_id,\n        source_row_number: r.source_row_number,\n        raw_record: r.raw_record,\n        rejection_reason: r.rejection_reason,\n    }));\n\nif (records.length === 0) {\n    return [{ json: { rows: [] } }];\n}\n\nconst BATCH_SIZE = 500;\nconst batches = [];\n\nfor (let i = 0; i < records.length; i += BATCH_SIZE) {\n    batches.push(records.slice(i, i + BATCH_SIZE));\n}\n\nreturn batches.map(rows => ({ json: { rows } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        400
+      ],
+      "id": "607f8b09-a6da-4591-a3d8-92f93c132bf3",
+      "name": "Prepare Rejected Record Batches",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH inserted AS (\n    INSERT INTO rejected_records (\n        batch_id,\n        source_row_number,\n        raw_record,\n        rejection_reason\n    )\n    SELECT\n        r.batch_id,\n        r.source_row_number,\n        r.raw_record,\n        r.rejection_reason\n    FROM jsonb_to_recordset($1::jsonb) AS r (\n        batch_id UUID,\n        source_row_number INTEGER,\n        raw_record JSONB,\n        rejection_reason TEXT\n    )\n    ON CONFLICT (batch_id, source_row_number)\n    DO NOTHING\n    RETURNING 1\n)\nSELECT COUNT(*)::INTEGER AS inserted_records\nFROM inserted;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{ [JSON.stringify($json.rows)] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        1792,
+        400
+      ],
+      "id": "2cd61d7f-0d4a-4a6b-b68f-4eb32d569c8e",
+      "name": "Insert Rejected Records",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2016,
+        304
+      ],
+      "id": "7d310725-a1a1-4c12-aa4c-d58f5755f848",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH record_counts AS (\n    SELECT\n        (\n            SELECT COUNT(*)\n            FROM sales_transactions\n            WHERE batch_id = $1::UUID\n        ) AS valid_count,\n\n        (\n            SELECT COUNT(*)\n            FROM rejected_records\n            WHERE batch_id = $1::UUID\n        ) AS rejected_count\n)\nUPDATE ingestion_batches AS b\nSET\n    total_records = rc.valid_count + rc.rejected_count,\n    valid_records = rc.valid_count,\n    rejected_records = rc.rejected_count,\n    status = 'completed',\n    completed_at = NOW(),\n    error_message = NULL\nFROM record_counts AS rc\nWHERE b.batch_id = $1::UUID\n  AND b.status = 'processing'\nRETURNING\n    b.batch_id,\n    b.source_file,\n    b.status,\n    b.total_records,\n    b.valid_records,\n    b.rejected_records,\n    b.started_at,\n    b.completed_at;",
+        "options": {
+          "queryBatching": "single",
+          "queryReplacement": "={{ [$('Create Ingestion Batch').first().json.batch_id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        2240,
+        304
+      ],
+      "id": "733580d4-174f-434d-bf8c-f077f937c1b3",
+      "name": "Finalize Ingestion Batch",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger - Start Ingestion": {
+      "main": [
+        [
+          {
+            "node": "Read Sample CSV - Hash",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract  CSV Records": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Validate Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Validate Records": {
+      "main": [
+        [
+          {
+            "node": "Prepare Valid Transaction Batches",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Rejected Record Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate File SHA256": {
+      "main": [
+        [
+          {
+            "node": "Create Ingestion Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Ingestion Batch": {
+      "main": [
+        [
+          {
+            "node": "Read Sample CSV - Extract ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Sample CSV - Hash": {
+      "main": [
+        [
+          {
+            "node": "Calculate File SHA256",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Sample CSV - Extract ": {
+      "main": [
+        [
+          {
+            "node": "Extract  CSV Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Valid Transaction Batches": {
+      "main": [
+        [
+          {
+            "node": "Insert Sales Transactions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Rejected Record Batches": {
+      "main": [
+        [
+          {
+            "node": "Insert Rejected Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Sales Transactions": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Rejected Records": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Finalize Ingestion Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "dbe3b4ef-042e-4c6f-8faa-b62ef4940c09",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "fbb7a1cbfc5f2bce585a9d1ef99ad3cf9ed9321ea46594f7ea295034e40dca00"
+  },
+  "nodeGroups": [],
+  "id": "KsaejcyplzThx65M",
+  "tags": []
+}
