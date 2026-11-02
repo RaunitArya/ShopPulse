@@ -1,0 +1,256 @@
+{
+  "name": "WF-02 - Sales Analytics",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "bc422fc9-f34b-4144-a9f0-02293c997bf4",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n    COUNT(DISTINCT b.batch_id) AS completed_batches,\n    COUNT(st.id) AS total_transactions,\n    COUNT(*) FILTER (\n        WHERE st.is_cancellation\n    ) AS cancellation_records,\n    MIN(st.invoice_date) AS first_transaction_date,\n    MAX(st.invoice_date) AS last_transaction_date\nFROM ingestion_batches b\nLEFT JOIN sales_transactions st\n    ON st.batch_id = b.batch_id\nWHERE b.status = 'completed';",
+        "options": {
+          "queryBatching": "single"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        224,
+        0
+      ],
+      "id": "33a9494a-b906-488e-a89c-8fd73856cb7e",
+      "name": "Get Analytics Scope",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH revenue_metrics AS (\n    SELECT\n        COUNT(*) AS total_transaction_lines,\n\n        COUNT(*) FILTER (\n            WHERE NOT st.is_cancellation\n        ) AS sales_transaction_lines,\n\n        COALESCE(\n            SUM(st.line_amount) FILTER (\n                WHERE NOT st.is_cancellation\n            ),\n            0\n        ) AS gross_revenue,\n\n        COALESCE(\n            SUM(ABS(st.line_amount)) FILTER (\n                WHERE st.is_cancellation\n            ),\n            0\n        ) AS cancellation_value\n\n    FROM sales_transactions st\n    INNER JOIN ingestion_batches b\n        ON b.batch_id = st.batch_id\n    WHERE b.status = 'completed'\n)\n\nSELECT\n    total_transaction_lines,\n    sales_transaction_lines,\n    gross_revenue,\n    cancellation_value,\n    gross_revenue - cancellation_value AS net_revenue\nFROM revenue_metrics;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        448,
+        0
+      ],
+      "id": "0c476863-0b52-465f-889c-2810c0836bd7",
+      "name": "Calculate Revenue KPIs",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH order_metrics AS (\n    SELECT\n        COUNT(DISTINCT invoice_no) FILTER (\n            WHERE NOT is_cancellation\n        ) AS completed_orders,\n\n        COUNT(DISTINCT invoice_no) FILTER (\n            WHERE is_cancellation\n        ) AS cancelled_orders,\n\n        COUNT(DISTINCT invoice_no) AS total_invoices,\n\n        COALESCE(\n            SUM(quantity) FILTER (\n                WHERE NOT is_cancellation\n            ),\n            0\n        ) AS total_items_sold,\n\n        COALESCE(\n            SUM(line_amount) FILTER (\n                WHERE NOT is_cancellation\n            ),\n            0\n        ) AS gross_revenue,\n\n        COALESCE(\n            SUM(ABS(line_amount)) FILTER (\n                WHERE is_cancellation\n            ),\n            0\n        ) AS cancellation_value\n\n    FROM sales_transactions st\n    INNER JOIN ingestion_batches b\n        ON b.batch_id = st.batch_id\n    WHERE b.status = 'completed'\n)\n\nSELECT\n    completed_orders,\n    cancelled_orders,\n    total_invoices,\n\n    ROUND(\n        100.0 * cancelled_orders /\n        NULLIF(total_invoices, 0),\n        2\n    ) AS cancellation_rate_pct,\n\n    total_items_sold,\n\n    ROUND(\n        total_items_sold::NUMERIC /\n        NULLIF(completed_orders, 0),\n        2\n    ) AS average_items_per_order,\n\n    gross_revenue,\n    cancellation_value,\n\n    ROUND(\n        gross_revenue / NULLIF(completed_orders, 0),\n        2\n    ) AS average_order_value\n\nFROM order_metrics;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        672,
+        0
+      ],
+      "id": "1d7448ff-e6cc-49fc-9c45-3d9ea07c7d6b",
+      "name": "Calculate Order KPIs",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH product_metrics AS (\n    SELECT\n        COUNT(DISTINCT stock_code) FILTER (\n            WHERE NOT is_cancellation\n        ) AS distinct_products_sold,\n\n        SUM(quantity) FILTER (\n            WHERE NOT is_cancellation\n        ) AS total_units_sold,\n\n        SUM(ABS(quantity)) FILTER (\n            WHERE is_cancellation\n        ) AS cancellation_units\n\n    FROM sales_transactions st\n    INNER JOIN ingestion_batches b\n        ON b.batch_id = st.batch_id\n    WHERE b.status = 'completed'\n),\n\ntop_products_quantity AS (\n    SELECT\n        stock_code,\n        MAX(description) AS product_name,\n        SUM(quantity) AS units_sold,\n        SUM(line_amount) AS gross_revenue\n    FROM sales_transactions st\n    INNER JOIN ingestion_batches b\n        ON b.batch_id = st.batch_id\n    WHERE\n        b.status = 'completed'\n        AND NOT st.is_cancellation\n    GROUP BY stock_code\n    ORDER BY units_sold DESC\n    LIMIT 10\n),\n\ntop_products_revenue AS (\n    SELECT\n        stock_code,\n        MAX(description) AS product_name,\n        SUM(quantity) AS units_sold,\n        SUM(line_amount) AS gross_revenue\n    FROM sales_transactions st\n    INNER JOIN ingestion_batches b\n        ON b.batch_id = st.batch_id\n    WHERE\n        b.status = 'completed'\n        AND NOT st.is_cancellation\n    GROUP BY stock_code\n    ORDER BY gross_revenue DESC\n    LIMIT 10\n)\n\nSELECT\n    (\n        SELECT row_to_json(pm)\n        FROM product_metrics pm\n    ) AS overall_metrics,\n\n    (\n        SELECT json_agg(tq)\n        FROM top_products_quantity tq\n    ) AS top_10_by_quantity,\n\n    (\n        SELECT json_agg(tr)\n        FROM top_products_revenue tr\n    ) AS top_10_by_revenue;",
+        "options": {
+          "queryBatching": "single"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        896,
+        0
+      ],
+      "id": "5d10e157-4fd4-42ca-b9e1-b638e2d396b6",
+      "name": "Calculate Product KPIs",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH country_metrics AS (\n    SELECT\n        st.country,\n\n        COUNT(DISTINCT st.invoice_no) FILTER (\n            WHERE NOT st.is_cancellation\n        ) AS completed_orders,\n\n        COUNT(*) FILTER (\n            WHERE NOT st.is_cancellation\n        ) AS sales_transaction_lines,\n\n        SUM(st.quantity) FILTER (\n            WHERE NOT st.is_cancellation\n        ) AS units_sold,\n\n        COALESCE(\n            SUM(st.line_amount) FILTER (\n                WHERE NOT st.is_cancellation\n            ),\n            0\n        ) AS gross_revenue,\n\n        COALESCE(\n            SUM(ABS(st.line_amount)) FILTER (\n                WHERE st.is_cancellation\n            ),\n            0\n        ) AS cancellation_value\n\n    FROM sales_transactions st\n    INNER JOIN ingestion_batches b\n        ON b.batch_id = st.batch_id\n\n    WHERE b.status = 'completed'\n\n    GROUP BY st.country\n),\n\ncountry_summary AS (\n    SELECT\n        country,\n        completed_orders,\n        sales_transaction_lines,\n        units_sold,\n        gross_revenue,\n        cancellation_value,\n\n        gross_revenue - cancellation_value AS net_revenue,\n\n        ROUND(\n            gross_revenue / NULLIF(completed_orders, 0),\n            2\n        ) AS average_order_value\n\n    FROM country_metrics\n),\n\ntop_countries AS (\n    SELECT *\n    FROM country_summary\n    ORDER BY gross_revenue DESC\n    LIMIT 10\n)\n\nSELECT\n    (\n        SELECT COUNT(*)\n        FROM country_summary\n    ) AS total_countries,\n\n    (\n        SELECT COALESCE(SUM(completed_orders), 0)\n        FROM country_summary\n    ) AS total_completed_orders,\n\n    (\n        SELECT COALESCE(SUM(gross_revenue), 0)\n        FROM country_summary\n    ) AS total_gross_revenue,\n\n    (\n        SELECT json_agg(\n            tc ORDER BY tc.gross_revenue DESC\n        )\n        FROM top_countries tc\n    ) AS top_10_countries;",
+        "options": {
+          "queryBatching": "single"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        1120,
+        0
+      ],
+      "id": "ad3e207c-938a-492f-9942-1dfc3fdf6951",
+      "name": "Calculate Country KPIs",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH completed_transactions AS (\n    SELECT\n        st.invoice_date::DATE AS sales_date,\n        DATE_TRUNC('month', st.invoice_date)::DATE AS sales_month,\n        st.invoice_no,\n        st.quantity,\n        st.line_amount,\n        st.is_cancellation\n\n    FROM sales_transactions st\n    INNER JOIN ingestion_batches b\n        ON b.batch_id = st.batch_id\n\n    WHERE b.status = 'completed'\n),\n\ndaily_metrics AS (\n    SELECT\n        sales_date,\n\n        COUNT(DISTINCT invoice_no) FILTER (\n            WHERE NOT is_cancellation\n        ) AS completed_orders,\n\n        COALESCE(\n            SUM(line_amount) FILTER (\n                WHERE NOT is_cancellation\n            ),\n            0\n        ) AS gross_revenue,\n\n        COALESCE(\n            SUM(ABS(line_amount)) FILTER (\n                WHERE is_cancellation\n            ),\n            0\n        ) AS cancellation_value\n\n    FROM completed_transactions\n    GROUP BY sales_date\n),\n\nmonthly_metrics AS (\n    SELECT\n        sales_month,\n\n        COUNT(DISTINCT invoice_no) FILTER (\n            WHERE NOT is_cancellation\n        ) AS completed_orders,\n\n        COALESCE(\n            SUM(quantity) FILTER (\n                WHERE NOT is_cancellation\n            ),\n            0\n        ) AS units_sold,\n\n        COALESCE(\n            SUM(line_amount) FILTER (\n                WHERE NOT is_cancellation\n            ),\n            0\n        ) AS gross_revenue,\n\n        COALESCE(\n            SUM(ABS(line_amount)) FILTER (\n                WHERE is_cancellation\n            ),\n            0\n        ) AS cancellation_value\n\n    FROM completed_transactions\n    GROUP BY sales_month\n),\n\nmonthly_growth AS (\n    SELECT\n        *,\n        gross_revenue - cancellation_value AS net_revenue,\n\n        LAG(gross_revenue) OVER (\n            ORDER BY sales_month\n        ) AS previous_month_revenue\n\n    FROM monthly_metrics\n),\n\nmonthly_results AS (\n    SELECT\n        sales_month,\n        completed_orders,\n        units_sold,\n        gross_revenue,\n        cancellation_value,\n        net_revenue,\n\n        ROUND(\n            100.0 * (\n                gross_revenue - previous_month_revenue\n            ) / NULLIF(previous_month_revenue, 0),\n            2\n        ) AS revenue_growth_pct\n\n    FROM monthly_growth\n)\n\nSELECT\n    (\n        SELECT json_agg(\n            d ORDER BY d.sales_date\n        )\n        FROM daily_metrics d\n    ) AS daily_metrics,\n\n    (\n        SELECT json_agg(\n            m ORDER BY m.sales_month\n        )\n        FROM monthly_results m\n    ) AS monthly_metrics;",
+        "options": {
+          "queryBatching": "single"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        1344,
+        0
+      ],
+      "id": "3e75458d-80f1-4cf0-9e9a-38afe1afb523",
+      "name": "Calculate Time-Series KPIs",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Collect the output of each analytics query.\nconst scope = $('Get Analytics Scope').first().json;\nconst revenue = $('Calculate Revenue KPIs').first().json;\nconst orders = $('Calculate Order KPIs').first().json;\nconst products = $('Calculate Product KPIs').first().json;\nconst geography = $('Calculate Country KPIs').first().json;\nconst timeSeries = $('Calculate Time-Series KPIs').first().json;\n\n// Build one consolidated analytics payload.\nconst payload = {\n    metadata: {\n        project: 'ShopPulse',\n        source_dataset: 'UCI Online Retail',\n        dataset_scope: '10,000-row sample',\n        currency: 'GBP',\n        completed_batches: Number(scope.completed_batches),\n        total_transactions: Number(scope.total_transactions),\n\n        period: {\n            start: scope.first_transaction_date,\n            end: scope.last_transaction_date\n        },\n\n        generated_at: new Date().toISOString()\n    },\n\n    scope,\n\n    revenue,\n\n    orders,\n\n    products,\n\n    geography,\n\n    time_series: timeSeries\n};\n\n// Return exactly one item for downstream workflows.\nreturn [\n    {\n        json: payload\n    }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        0
+      ],
+      "id": "e66aa924-16ac-4fb7-bf9e-80beb7eddaa5",
+      "name": "Build Analytics Payload"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Get Analytics Scope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Analytics Scope": {
+      "main": [
+        [
+          {
+            "node": "Calculate Revenue KPIs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Revenue KPIs": {
+      "main": [
+        [
+          {
+            "node": "Calculate Order KPIs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Order KPIs": {
+      "main": [
+        [
+          {
+            "node": "Calculate Product KPIs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Product KPIs": {
+      "main": [
+        [
+          {
+            "node": "Calculate Country KPIs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Country KPIs": {
+      "main": [
+        [
+          {
+            "node": "Calculate Time-Series KPIs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Time-Series KPIs": {
+      "main": [
+        [
+          {
+            "node": "Build Analytics Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "ee525843-dcba-48ce-9e36-d99813ac736c",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "fbb7a1cbfc5f2bce585a9d1ef99ad3cf9ed9321ea46594f7ea295034e40dca00"
+  },
+  "nodeGroups": [],
+  "id": "CdfgHfzCmovlOGGx",
+  "tags": []
+}
