@@ -27,7 +27,7 @@ services:
       - shoppulse-network
 
   n8n:
-    image: docker.n8n.io/n8nio/n8n:latest
+    image: docker.n8n.io/n8nio/n8n:2.45.7
     container_name: shoppulse-n8n
     restart: unless-stopped
 
@@ -48,6 +48,7 @@ services:
       N8N_PROTOCOL: http
       N8N_SECURE_COOKIE: "false"
       N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_RESTRICT_FILE_ACCESS_TO: /files
 
       GENERIC_TIMEZONE: Asia/Kolkata
       TZ: Asia/Kolkata
