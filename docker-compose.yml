@@ -64,6 +64,16 @@ services:
     networks:
       - shoppulse-network
 
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    container_name: shoppulse-gotenberg
+    restart: unless-stopped
+    expose:
+       - "3000"
+
+    networks:
+       - shoppulse-network
+
 volumes:
   postgres18_data:
   n8n_data:
