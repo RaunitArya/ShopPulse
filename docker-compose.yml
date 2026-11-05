@@ -48,7 +48,7 @@ services:
       N8N_PROTOCOL: http
       N8N_SECURE_COOKIE: "false"
       N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
-      N8N_RESTRICT_FILE_ACCESS_TO: /files
+      N8N_RESTRICT_FILE_ACCESS_TO: /files; /reports
 
       GENERIC_TIMEZONE: Asia/Kolkata
       TZ: Asia/Kolkata
@@ -56,6 +56,7 @@ services:
     volumes:
       - n8n_data:/home/node/.n8n
       - ./data:/files:ro
+      - ./reports:/reports
 
     depends_on:
       postgres:
