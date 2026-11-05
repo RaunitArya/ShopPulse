@@ -1,0 +1,559 @@
+{
+  "name": "WF-03-report-delivery",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -64
+      ],
+      "id": "99e730f3-4bad-496d-9d35-908e32e2f3c8",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n    report_id,\n    generated_at,\n    dataset_scope,\n    currency,\n    period_start,\n    period_end,\n    payload\nFROM analytics_reports\nORDER BY generated_at DESC, report_id DESC\nLIMIT 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        224,
+        -64
+      ],
+      "id": "0d146df7-8268-495e-bb96-e910cb356c42",
+      "name": "Get Latest Analytics Report",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst items = $input.all();\n\nif (items.length !== 1) {\n  throw new Error(\n    `Expected exactly one analytics report, received ${items.length}`\n  );\n}\n\nconst report = items[0].json;\nconst payload = report.payload;\n\nif (!payload || typeof payload !== 'object') {\n  throw new Error('Report payload is missing or invalid');\n}\n\nconst requiredSections = [\n  'scope',\n  'orders',\n  'revenue',\n  'metadata',\n  'products',\n  'geography',\n  'time_series',\n];\n\nfor (const section of requiredSections) {\n  if (!payload[section] || typeof payload[section] !== 'object') {\n    throw new Error(`Missing or invalid payload section: ${section}`);\n  }\n}\n\nconst requiredArrays = [\n  ['products', 'top_10_by_revenue'],\n  ['products', 'top_10_by_quantity'],\n  ['geography', 'top_10_countries'],\n  ['time_series', 'monthly_metrics'],\n  ['time_series', 'daily_metrics'],\n];\n\nfor (const [section, field] of requiredArrays) {\n  if (!Array.isArray(payload[section][field])) {\n    throw new Error(`Expected ${section}.${field} to be an array`);\n  }\n}\n\n// JSONB values may be numeric strings.\n// Validate them without modifying the original payload.\nconst numericFields = [\n  ['orders', 'gross_revenue'],\n  ['orders', 'cancellation_rate_pct'],\n  ['orders', 'average_order_value'],\n  ['orders', 'completed_orders'],\n  ['orders', 'cancelled_orders'],\n  ['revenue', 'gross_revenue'],\n  ['revenue', 'net_revenue'],\n  ['revenue', 'cancellation_value'],\n];\n\nfor (const [section, field] of numericFields) {\n  const value = payload[section][field];\n\n  if (value === null || value === undefined || !Number.isFinite(Number(value))) {\n    throw new Error(`Invalid numeric value: ${section}.${field}`);\n  }\n}\n\nconst period = payload.metadata.period;\n\nif (!period?.start || !period?.end) {\n  throw new Error('Business reporting period is missing');\n}\n\nreturn [{\n  json: {\n    ...report,\n    report_validation: {\n      valid: true,\n      validated_at: new Date().toISOString(),\n      sections_found: requiredSections,\n      monthly_records: payload.time_series.monthly_metrics.length,\n      daily_records: payload.time_series.daily_metrics.length,\n      business_period: {\n        start: period.start,\n        end: period.end,\n      },\n    },\n  },\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        -64
+      ],
+      "id": "4bfe5c4d-2c9b-4ebb-b513-334c6912e42a",
+      "name": "Validate Report Structure"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst items = $input.all();\n\nif (items.length !== 1) {\n  throw new Error(`Expected one report, received ${items.length}`);\n}\n\nconst report = items[0].json;\nconst payload = report.payload;\n\nfunction toNumber(value, field) {\n  if (value === null || value === undefined || value === '') {\n    throw new Error(`Missing numeric value: ${field}`);\n  }\n\n  const number = Number(value);\n\n  if (!Number.isFinite(number)) {\n    throw new Error(`Invalid numeric value: ${field}`);\n  }\n\n  return number;\n}\n\nfunction normalizeRows(rows, fields, section) {\n  return rows.map((row, index) => {\n    const normalized = { ...row };\n\n    for (const field of fields) {\n      if (normalized[field] !== null && normalized[field] !== undefined) {\n        normalized[field] = toNumber(\n          normalized[field],\n          `${section}[${index}].${field}`\n        );\n      }\n    }\n\n    return normalized;\n  });\n}\n\n// Reporting period: use business dates from metadata, not outer\n// PostgreSQL timestamp fields that may have serialization shifts.\nconst periodStart = payload.metadata.period.start.slice(0, 10);\nconst periodEnd = payload.metadata.period.end.slice(0, 10);\n\nconst endDate = new Date(`${periodEnd}T00:00:00Z`);\nconst lastDayOfEndMonth = new Date(\n  Date.UTC(\n    endDate.getUTCFullYear(),\n    endDate.getUTCMonth() + 1,\n    0\n  )\n).getUTCDate();\n\nconst isFinalMonthPartial =\n  endDate.getUTCDate() < lastDayOfEndMonth;\n\n// Normalize monthly metrics and identify the partial final month.\nconst monthlyMetrics = normalizeRows(\n  payload.time_series.monthly_metrics,\n  [\n    'units_sold',\n    'net_revenue',\n    'gross_revenue',\n    'completed_orders',\n    'cancellation_value',\n    'revenue_growth_pct',\n  ],\n  'monthly_metrics'\n).map((month) => {\n  const monthKey = month.sales_month.slice(0, 7);\n  const endMonthKey = periodEnd.slice(0, 7);\n\n  const isPartial =\n    monthKey === endMonthKey && isFinalMonthPartial;\n\n  return {\n    ...month,\n    is_partial_period: isPartial,\n\n    // Do not compare a partial month directly with a full month.\n    comparable_revenue_growth_pct: isPartial\n      ? null\n      : month.revenue_growth_pct,\n  };\n});\n\nconst dailyMetrics = normalizeRows(\n  payload.time_series.daily_metrics,\n  ['gross_revenue', 'completed_orders', 'cancellation_value'],\n  'daily_metrics'\n);\n\nconst topProductsByRevenue = normalizeRows(\n  payload.products.top_10_by_revenue,\n  ['units_sold', 'gross_revenue'],\n  'top_10_by_revenue'\n);\n\nconst topProductsByQuantity = normalizeRows(\n  payload.products.top_10_by_quantity,\n  ['units_sold', 'gross_revenue'],\n  'top_10_by_quantity'\n);\n\nconst topCountries = normalizeRows(\n  payload.geography.top_10_countries,\n  [\n    'units_sold',\n    'net_revenue',\n    'gross_revenue',\n    'completed_orders',\n    'cancellation_value',\n    'average_order_value',\n    'sales_transaction_lines',\n  ],\n  'top_10_countries'\n);\n\nconst preparedData = {\n  report: {\n    id: report.report_id,\n    generated_at: report.generated_at,\n    project: payload.metadata.project,\n    source_dataset: payload.metadata.source_dataset,\n    dataset_scope: report.dataset_scope,\n    currency: report.currency,\n    period: {\n      start: periodStart,\n      end: periodEnd,\n    },\n  },\n\n  scope: {\n    completed_batches: toNumber(\n      payload.scope.completed_batches,\n      'scope.completed_batches'\n    ),\n    total_transactions: toNumber(\n      payload.scope.total_transactions,\n      'scope.total_transactions'\n    ),\n    cancellation_records: toNumber(\n      payload.scope.cancellation_records,\n      'scope.cancellation_records'\n    ),\n  },\n\n  orders: {\n    gross_revenue: toNumber(payload.orders.gross_revenue, 'orders.gross_revenue'),\n    total_invoices: toNumber(payload.orders.total_invoices, 'orders.total_invoices'),\n    cancelled_orders: toNumber(payload.orders.cancelled_orders, 'orders.cancelled_orders'),\n    completed_orders: toNumber(payload.orders.completed_orders, 'orders.completed_orders'),\n    total_items_sold: toNumber(payload.orders.total_items_sold, 'orders.total_items_sold'),\n    cancellation_value: toNumber(payload.orders.cancellation_value, 'orders.cancellation_value'),\n    average_order_value: toNumber(payload.orders.average_order_value, 'orders.average_order_value'),\n    cancellation_rate_pct: toNumber(payload.orders.cancellation_rate_pct, 'orders.cancellation_rate_pct'),\n    average_items_per_order: toNumber(payload.orders.average_items_per_order, 'orders.average_items_per_order'),\n  },\n\n  revenue: {\n    gross_revenue: toNumber(payload.revenue.gross_revenue, 'revenue.gross_revenue'),\n    net_revenue: toNumber(payload.revenue.net_revenue, 'revenue.net_revenue'),\n    cancellation_value: toNumber(payload.revenue.cancellation_value, 'revenue.cancellation_value'),\n    sales_transaction_lines: toNumber(payload.revenue.sales_transaction_lines, 'revenue.sales_transaction_lines'),\n    total_transaction_lines: toNumber(payload.revenue.total_transaction_lines, 'revenue.total_transaction_lines'),\n  },\n\n  products: {\n    overall_metrics: {\n      total_units_sold: toNumber(\n        payload.products.overall_metrics.total_units_sold,\n        'products.total_units_sold'\n      ),\n      cancellation_units: toNumber(\n        payload.products.overall_metrics.cancellation_units,\n        'products.cancellation_units'\n      ),\n      distinct_products_sold: toNumber(\n        payload.products.overall_metrics.distinct_products_sold,\n        'products.distinct_products_sold'\n      ),\n    },\n    top_10_by_revenue: topProductsByRevenue,\n    top_10_by_quantity: topProductsByQuantity,\n  },\n\n  geography: {\n    total_countries: toNumber(\n      payload.geography.total_countries,\n      'geography.total_countries'\n    ),\n    total_gross_revenue: toNumber(\n      payload.geography.total_gross_revenue,\n      'geography.total_gross_revenue'\n    ),\n    total_completed_orders: toNumber(\n      payload.geography.total_completed_orders,\n      'geography.total_completed_orders'\n    ),\n    top_10_countries: topCountries,\n  },\n\n  time_series: {\n    daily_metrics: dailyMetrics,\n    monthly_metrics: monthlyMetrics,\n  },\n\n  data_quality: {\n    monthly_records: monthlyMetrics.length,\n    daily_active_dates: dailyMetrics.length,\n    final_month_is_partial: isFinalMonthPartial,\n    partial_month: isFinalMonthPartial ? periodEnd.slice(0, 7) : null,\n  },\n};\n\nreturn [{\n  json: {\n    report_data: preparedData,\n\n    // Retain the original source payload for auditability.\n    source_payload: payload,\n\n    report_validation: report.report_validation,\n  },\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        -64
+      ],
+      "id": "b22fcd7b-068e-4ea5-835d-7eb4acb48f71",
+      "name": "Prepare Report Data"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst items = $input.all();\n\nif (items.length !== 1) {\n  throw new Error(`Expected one prepared report, received ${items.length}`);\n}\n\nconst input = items[0].json;\nconst report = input.report_data;\n\nif (!report?.orders || !report?.scope || !report?.products?.overall_metrics) {\n  throw new Error('Required order metrics are missing from report_data');\n}\n\nconst orders = report.orders;\nconst scope = report.scope;\nconst products = report.products.overall_metrics;\n\nconst totalInvoices = orders.total_invoices;\nconst completedOrders = orders.completed_orders;\nconst cancelledOrders = orders.cancelled_orders;\n\nif (totalInvoices <= 0) {\n  throw new Error('Total invoices must be greater than zero');\n}\n\n// Calculate rates from the underlying counts.\n// These calculations also let us cross-check stored percentages.\nconst completionRate = (completedOrders / totalInvoices) * 100;\nconst cancellationRate = (cancelledOrders / totalInvoices) * 100;\n\nconst calculatedCancellationRate = Number(\n  cancellationRate.toFixed(2)\n);\n\nconst storedCancellationRate = orders.cancellation_rate_pct;\n\n// Generate deterministic business observations.\nconst findings = [\n  {\n    type: 'positive',\n    title: 'Strong order completion rate',\n    description:\n      `${completedOrders.toLocaleString('en-GB')} of ` +\n      `${totalInvoices.toLocaleString('en-GB')} invoices were completed, ` +\n      `representing a ${completionRate.toFixed(2)}% completion rate.`\n  },\n  {\n    type: calculatedCancellationRate >= 5 ? 'warning' : 'neutral',\n    title: 'Order cancellation rate',\n    description:\n      `${cancelledOrders.toLocaleString('en-GB')} orders were cancelled, ` +\n      `representing ${calculatedCancellationRate.toFixed(2)}% of all invoices.`\n  },\n  {\n    type: 'neutral',\n    title: 'Average order value',\n    description:\n      `The average order value was ${report.report.currency} ` +\n      `${orders.average_order_value.toFixed(2)}.`\n  },\n  {\n    type: 'neutral',\n    title: 'Average basket size',\n    description:\n      `Each completed order contained approximately ` +\n      `${orders.average_items_per_order.toFixed(2)} items on average.`\n  },\n  {\n    type: 'info',\n    title: 'Cancellation records versus cancelled orders',\n    description:\n      `The dataset contains ${scope.cancellation_records.toLocaleString('en-GB')} ` +\n      `cancellation records and ${cancelledOrders.toLocaleString('en-GB')} ` +\n      `cancelled orders. These are separate measures.`\n  }\n];\n\nconst ordersInsights = {\n  summary: {\n    total_invoices: totalInvoices,\n    completed_orders: completedOrders,\n    cancelled_orders: cancelledOrders,\n    completion_rate_pct: Number(completionRate.toFixed(2)),\n    cancellation_rate_pct: calculatedCancellationRate,\n    stored_cancellation_rate_pct: storedCancellationRate,\n    average_order_value: orders.average_order_value,\n    average_items_per_order: orders.average_items_per_order,\n    total_items_sold: orders.total_items_sold,\n    cancellation_records: scope.cancellation_records,\n    cancellation_units: products.cancellation_units\n  },\n\n  findings,\n\n  validation: {\n    completion_and_cancellation_counts_match:\n      completedOrders + cancelledOrders === totalInvoices,\n\n    cancellation_rate_matches_stored:\n      calculatedCancellationRate === Number(storedCancellationRate.toFixed(2))\n  }\n};\n\nreturn [{\n  json: {\n    ...input,\n    orders_insights: ordersInsights\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        -64
+      ],
+      "id": "b4073dd1-a82c-4ec7-95a4-d176eb27f75b",
+      "name": "Generate Orders Insights"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nif (items.length !== 1) {\n  throw new Error(`Expected one report, received ${items.length}`);\n}\n\nconst input = items[0].json;\nconst report = input.report_data;\n\nif (!report?.revenue) {\n  throw new Error('Revenue metrics are missing from report_data');\n}\n\nconst revenue = report.revenue;\n\nconst grossRevenue = revenue.gross_revenue;\nconst netRevenue = revenue.net_revenue;\nconst cancellationValue = revenue.cancellation_value;\n\nconst salesLines = revenue.sales_transaction_lines;\nconst totalLines = revenue.total_transaction_lines;\n\nif (grossRevenue <= 0) {\n  throw new Error('Gross revenue must be greater than zero');\n}\n\nif (totalLines <= 0) {\n  throw new Error('Total transaction lines must be greater than zero');\n}\n\n// Calculate revenue performance indicators.\nconst revenueLostPct =\n  (cancellationValue / grossRevenue) * 100;\n\nconst revenueRetainedPct =\n  (netRevenue / grossRevenue) * 100;\n\nconst salesLineRatioPct =\n  (salesLines / totalLines) * 100;\n\n// Calculate expected net revenue independently.\nconst calculatedNetRevenue =\n  grossRevenue - cancellationValue;\n\n// Currency rounding for reconciliation.\nconst roundCurrency = (value) =>\n  Number(value.toFixed(2));\n\nconst roundedGrossRevenue = roundCurrency(grossRevenue);\nconst roundedNetRevenue = roundCurrency(netRevenue);\nconst roundedCancellationValue = roundCurrency(cancellationValue);\nconst roundedCalculatedNetRevenue = roundCurrency(calculatedNetRevenue);\n\n// Generate deterministic business observations.\nconst findings = [\n  {\n    type: 'positive',\n    title: 'Net revenue generated',\n    description:\n      `The business generated ${report.report.currency} ` +\n      `${netRevenue.toLocaleString('en-GB', {\n        minimumFractionDigits: 2,\n        maximumFractionDigits: 2\n      })} in net revenue after accounting for cancellations.`\n  },\n  {\n    type: 'info',\n    title: 'Revenue impact of cancellations',\n    description:\n      `${report.report.currency} ` +\n      `${cancellationValue.toLocaleString('en-GB', {\n        minimumFractionDigits: 2,\n        maximumFractionDigits: 2\n      })} in revenue was associated with cancelled transactions, ` +\n      `representing ${revenueLostPct.toFixed(2)}% of gross revenue.`\n  },\n  {\n    type: 'positive',\n    title: 'Revenue retention',\n    description:\n      `${revenueRetainedPct.toFixed(2)}% of gross revenue was retained ` +\n      `as net revenue after cancellations.`\n  },\n  {\n    type: 'neutral',\n    title: 'Sales transaction activity',\n    description:\n      `${salesLines.toLocaleString('en-GB')} of ` +\n      `${totalLines.toLocaleString('en-GB')} transaction lines ` +\n      `were classified as sales lines, representing ` +\n      `${salesLineRatioPct.toFixed(2)}% of all transaction lines.`\n  }\n];\n\nconst revenueInsights = {\n  summary: {\n    gross_revenue: roundedGrossRevenue,\n    cancellation_value: roundedCancellationValue,\n    net_revenue: roundedNetRevenue,\n    revenue_lost_pct: Number(revenueLostPct.toFixed(2)),\n    revenue_retained_pct: Number(revenueRetainedPct.toFixed(2)),\n    sales_transaction_lines: salesLines,\n    total_transaction_lines: totalLines,\n    sales_line_ratio_pct: Number(salesLineRatioPct.toFixed(2))\n  },\n\n  findings,\n\n  validation: {\n    revenue_reconciles:\n      roundedCalculatedNetRevenue === roundedNetRevenue,\n\n    transaction_lines_reconcile:\n      salesLines <= totalLines,\n\n    revenue_percentages_reconcile:\n      Number(\n        (revenueLostPct + revenueRetainedPct).toFixed(2)\n      ) === 100\n  }\n};\n\nreturn [{\n  json: {\n    ...input,\n    revenue_insights: revenueInsights\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        -64
+      ],
+      "id": "89aea612-8f73-474b-a5f3-ea6a294558c6",
+      "name": "Generate Revenue Insights"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nif (items.length !== 1) {\n  throw new Error(`Expected one report, received ${items.length}`);\n}\n\nconst input = items[0].json;\nconst report = input.report_data;\n\nif (!report?.products || !report?.geography) {\n  throw new Error('Product or geography data is missing');\n}\n\nconst products = report.products;\nconst geography = report.geography;\n\nconst revenueRankings = products.top_10_by_revenue;\nconst quantityRankings = products.top_10_by_quantity;\nconst countries = geography.top_10_countries;\n\nif (\n  !Array.isArray(revenueRankings) ||\n  !Array.isArray(quantityRankings) ||\n  !Array.isArray(countries) ||\n  revenueRankings.length === 0 ||\n  quantityRankings.length === 0 ||\n  countries.length === 0\n) {\n  throw new Error('One or more ranking arrays are empty or invalid');\n}\n\n// Helpers\nconst round = (value) => Number(value.toFixed(2));\n\nconst percentage = (part, total) => {\n  if (total <= 0) return 0;\n  return round((part / total) * 100);\n};\n\nconst currency = report.report.currency;\n\nconst formatCurrency = (value) =>\n  `${currency} ${value.toLocaleString('en-GB', {\n    minimumFractionDigits: 2,\n    maximumFractionDigits: 2\n  })}`;\n\nconst productName = (product) =>\n  product.description ??\n  product.product_name ??\n  product.stock_code ??\n  'Unknown product';\n\n// Product analysis\nconst topProductByRevenue = revenueRankings[0];\nconst topProductByQuantity = quantityRankings[0];\n\nconst top10ProductRevenue = revenueRankings.reduce(\n  (total, product) => total + product.gross_revenue,\n  0\n);\n\nconst top10ProductUnits = quantityRankings.reduce(\n  (total, product) => total + product.units_sold,\n  0\n);\n\nconst totalGrossRevenue = report.revenue.gross_revenue;\nconst totalUnitsSold = products.overall_metrics.total_units_sold;\n\nconst top10RevenueContributionPct = percentage(\n  top10ProductRevenue,\n  totalGrossRevenue\n);\n\nconst top10QuantityContributionPct = percentage(\n  top10ProductUnits,\n  totalUnitsSold\n);\n\nconst sameLeadingProduct =\n  String(topProductByRevenue.stock_code) ===\n  String(topProductByQuantity.stock_code);\n\n// Geography analysis\nconst topCountryByNetRevenue = [...countries].sort(\n  (a, b) => b.net_revenue - a.net_revenue\n)[0];\n\nconst topCountryByGrossRevenue = [...countries].sort(\n  (a, b) => b.gross_revenue - a.gross_revenue\n)[0];\n\nconst top10CountryGrossRevenue = countries.reduce(\n  (total, country) => total + country.gross_revenue,\n  0\n);\n\nconst top10CountryNetRevenue = countries.reduce(\n  (total, country) => total + country.net_revenue,\n  0\n);\n\nconst totalNetRevenue = report.revenue.net_revenue;\n\nconst top10CountryGrossContributionPct = percentage(\n  top10CountryGrossRevenue,\n  totalGrossRevenue\n);\n\nconst top10CountryNetContributionPct = percentage(\n  top10CountryNetRevenue,\n  totalNetRevenue\n);\n\n// Identify the UK without assuming its position in the array.\nconst uk = countries.find(\n  (country) =>\n    String(country.country).trim().toLowerCase() ===\n    'united kingdom'\n);\n\nconst ukGrossRevenueSharePct = uk\n  ? percentage(uk.gross_revenue, totalGrossRevenue)\n  : null;\n\nconst ukNetRevenueSharePct = uk\n  ? percentage(uk.net_revenue, totalNetRevenue)\n  : null;\n\n// Build product ranking output.\nconst topProductsByRevenue = revenueRankings.map((product) => ({\n  stock_code: product.stock_code,\n  product_name: productName(product),\n  units_sold: product.units_sold,\n  gross_revenue: round(product.gross_revenue),\n  revenue_contribution_pct: percentage(\n    product.gross_revenue,\n    totalGrossRevenue\n  )\n}));\n\nconst topProductsByQuantity = quantityRankings.map((product) => ({\n  stock_code: product.stock_code,\n  product_name: productName(product),\n  units_sold: product.units_sold,\n  gross_revenue: round(product.gross_revenue)\n}));\n\n// Build geography ranking output.\nconst topCountries = [...countries]\n  .sort((a, b) => b.net_revenue - a.net_revenue)\n  .map((country) => ({\n    country: country.country,\n    gross_revenue: round(country.gross_revenue),\n    net_revenue: round(country.net_revenue),\n    completed_orders: country.completed_orders,\n    revenue_contribution_pct: percentage(\n      country.net_revenue,\n      totalNetRevenue\n    )\n  }));\n\n// Deterministic business findings.\nconst findings = [\n  {\n    type: 'positive',\n    title: 'Leading product by revenue',\n    description:\n      `${productName(topProductByRevenue)} ` +\n      `(stock code ${topProductByRevenue.stock_code}) generated ` +\n      `${formatCurrency(topProductByRevenue.gross_revenue)} in gross revenue.`\n  },\n  {\n    type: 'info',\n    title: 'Leading product by quantity',\n    description:\n      `${productName(topProductByQuantity)} ` +\n      `(stock code ${topProductByQuantity.stock_code}) led sales volume ` +\n      `with ${topProductByQuantity.units_sold.toLocaleString('en-GB')} units sold.`\n  },\n  {\n    type: 'neutral',\n    title: 'Top 10 product revenue contribution',\n    description:\n      `The top 10 products by revenue generated ` +\n      `${formatCurrency(top10ProductRevenue)}, accounting for ` +\n      `${top10RevenueContributionPct}% of total gross revenue.`\n  },\n  {\n    type: 'positive',\n    title: 'Leading geographical market',\n    description:\n      `${topCountryByNetRevenue.country} generated the highest net revenue ` +\n      `among the countries in the top 10 ranking, at ` +\n      `${formatCurrency(topCountryByNetRevenue.net_revenue)}.`\n  },\n  {\n    type: 'info',\n    title: 'UK revenue contribution',\n    description: uk\n      ? `The United Kingdom generated ${formatCurrency(uk.net_revenue)} ` +\n        `in net revenue, representing ${ukNetRevenueSharePct}% of total net revenue.`\n      : 'The United Kingdom was not found in the top 10 country results.'\n  },\n  {\n    type: 'neutral',\n    title: 'Geographical revenue concentration',\n    description:\n      `The top 10 countries generated ` +\n      `${formatCurrency(top10CountryNetRevenue)} in combined net revenue, ` +\n      `representing ${top10CountryNetContributionPct}% of total net revenue.`\n  }\n];\n\nconst productGeographyInsights = {\n  products: {\n    summary: {\n      distinct_products_sold: products.overall_metrics.distinct_products_sold,\n      total_units_sold: totalUnitsSold,\n      cancellation_units: products.overall_metrics.cancellation_units,\n      top_product_by_revenue: topProductsByRevenue[0],\n      top_product_by_quantity: topProductsByQuantity[0],\n      same_leading_product: sameLeadingProduct,\n      top_10_gross_revenue: round(top10ProductRevenue),\n      top_10_revenue_contribution_pct: top10RevenueContributionPct,\n      top_10_units_sold: top10ProductUnits,\n      top_10_quantity_contribution_pct: top10QuantityContributionPct\n    },\n    top_10_by_revenue: topProductsByRevenue,\n    top_10_by_quantity: topProductsByQuantity\n  },\n\n  geography: {\n    summary: {\n      total_countries: geography.total_countries,\n      top_country_by_net_revenue: topCountryByNetRevenue.country,\n      top_country_by_gross_revenue: topCountryByGrossRevenue.country,\n      top_10_gross_revenue: round(top10CountryGrossRevenue),\n      top_10_net_revenue: round(top10CountryNetRevenue),\n      top_10_gross_contribution_pct:\n        top10CountryGrossContributionPct,\n      top_10_net_contribution_pct:\n        top10CountryNetContributionPct,\n      uk: uk\n        ? {\n            gross_revenue: round(uk.gross_revenue),\n            net_revenue: round(uk.net_revenue),\n            gross_revenue_share_pct: ukGrossRevenueSharePct,\n            net_revenue_share_pct: ukNetRevenueSharePct\n          }\n        : null\n    },\n    top_10_countries: topCountries\n  },\n\n  findings\n};\n\nconst validation = {\n  // Product ranking checks\n  product_revenue_leader_matches_ranking:\n    topProductByRevenue.stock_code === revenueRankings[0].stock_code,\n\n  product_quantity_leader_matches_ranking:\n    topProductByQuantity.stock_code === quantityRankings[0].stock_code,\n\n  // Product aggregation checks\n  top_10_product_revenue_not_exceeding_total:\n    top10ProductRevenue <= totalGrossRevenue + 0.01,\n\n  top_10_product_units_not_exceeding_total:\n    top10ProductUnits <= totalUnitsSold,\n\n  // Geography aggregation checks\n  top_10_country_gross_revenue_not_exceeding_total:\n    top10CountryGrossRevenue <= totalGrossRevenue + 0.01,\n\n  top_10_country_net_revenue_not_exceeding_total:\n    top10CountryNetRevenue <= totalNetRevenue + 0.01\n};\n\nreturn [{\n  json: {\n    ...input,\n    product_geography_insights: {\n      ...productGeographyInsights,\n      validation\n    }\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        -64
+      ],
+      "id": "2df841e4-7c2d-47b8-a9c2-7d65616e4f02",
+      "name": "Generate Product & Geography Insights"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst items = $input.all();\n\nif (items.length !== 1) {\n  throw new Error(`Expected one report, received ${items.length}`);\n}\n\nconst input = items[0].json;\nconst report = input.report_data;\n\nif (!report?.time_series) {\n  throw new Error('Time-series data is missing');\n}\n\nconst monthlyMetrics = report.time_series.monthly_metrics;\nconst dailyMetrics = report.time_series.daily_metrics;\n\nif (\n  !Array.isArray(monthlyMetrics) ||\n  monthlyMetrics.length === 0 ||\n  !Array.isArray(dailyMetrics) ||\n  dailyMetrics.length === 0\n) {\n  throw new Error('Monthly or daily metrics are empty');\n}\n\nconst currency = report.report.currency;\n\nconst round = (value) => Number(value.toFixed(2));\n\nconst percentageChange = (current, previous) => {\n  if (previous === 0) return null;\n  return round(((current - previous) / previous) * 100);\n};\n\nconst formatCurrency = (value) =>\n  `${currency} ${value.toLocaleString('en-GB', {\n    minimumFractionDigits: 2,\n    maximumFractionDigits: 2\n  })}`;\n\nconst formatMonth = (month) => month.sales_month;\n\nconst formatDate = (date) => date.slice(0, 10);\n\n// --------------------------------------------------\n// 1. MONTHLY ANALYSIS\n// --------------------------------------------------\n\n// Separate full months from partial reporting periods.\nconst fullMonths = monthlyMetrics.filter(\n  (month) => !month.is_partial_period\n);\n\nif (fullMonths.length === 0) {\n  throw new Error('No complete months available for comparison');\n}\n\n// Sort chronologically to ensure correct comparisons.\nconst sortedMonths = [...monthlyMetrics].sort(\n  (a, b) => a.sales_month.localeCompare(b.sales_month)\n);\n\nconst sortedFullMonths = [...fullMonths].sort(\n  (a, b) => a.sales_month.localeCompare(b.sales_month)\n);\n\n// Identify highest and lowest gross-revenue months\n// using complete months only.\nconst bestRevenueMonth = sortedFullMonths.reduce(\n  (best, month) =>\n    month.gross_revenue > best.gross_revenue ? month : best\n);\n\nconst lowestRevenueMonth = sortedFullMonths.reduce(\n  (lowest, month) =>\n    month.gross_revenue < lowest.gross_revenue ? month : lowest\n);\n\n// Identify the month with the highest completed orders.\nconst bestOrdersMonth = sortedFullMonths.reduce(\n  (best, month) =>\n    month.completed_orders > best.completed_orders ? month : best\n);\n\n// Calculate month-over-month gross revenue growth\n// independently, excluding comparisons involving partial months.\nconst monthlyTrend = sortedMonths.map((month, index) => {\n  const previousMonth = index > 0\n    ? sortedMonths[index - 1]\n    : null;\n\n  let calculatedGrowthPct = null;\n\n  if (\n    previousMonth &&\n    !month.is_partial_period &&\n    !previousMonth.is_partial_period\n  ) {\n    calculatedGrowthPct = percentageChange(\n      month.gross_revenue,\n      previousMonth.gross_revenue\n    );\n  }\n\n  return {\n    sales_month: month.sales_month,\n    gross_revenue: round(month.gross_revenue),\n    net_revenue: round(month.net_revenue),\n    completed_orders: month.completed_orders,\n    cancellation_value: round(month.cancellation_value),\n\n    // Retain the growth metric from the source report.\n    source_revenue_growth_pct: month.revenue_growth_pct,\n\n    // Independently calculated growth using gross revenue.\n    calculated_gross_revenue_growth_pct: calculatedGrowthPct,\n\n    is_partial_period: month.is_partial_period\n  };\n});\n\n// Compare first and last complete months.\nconst firstFullMonth = sortedFullMonths[0];\nconst lastFullMonth = sortedFullMonths[sortedFullMonths.length - 1];\n\nconst fullPeriodRevenueChangePct = percentageChange(\n  lastFullMonth.gross_revenue,\n  firstFullMonth.gross_revenue\n);\n\n// --------------------------------------------------\n// 2. DAILY ANALYSIS\n// --------------------------------------------------\n\nconst totalDailyGrossRevenue = dailyMetrics.reduce(\n  (total, day) => total + day.gross_revenue,\n  0\n);\n\nconst totalDailyOrders = dailyMetrics.reduce(\n  (total, day) => total + day.completed_orders,\n  0\n);\n\n// Identify peak revenue day.\nconst bestRevenueDay = dailyMetrics.reduce(\n  (best, day) =>\n    day.gross_revenue > best.gross_revenue ? day : best\n);\n\n// Identify peak order-volume day.\nconst bestOrdersDay = dailyMetrics.reduce(\n  (best, day) =>\n    day.completed_orders > best.completed_orders ? day : best\n);\n\n// Calculate averages across active transaction dates only.\nconst averageDailyGrossRevenue =\n  totalDailyGrossRevenue / dailyMetrics.length;\n\nconst averageDailyOrders =\n  totalDailyOrders / dailyMetrics.length;\n\n// Find the daily peak's contribution to gross revenue.\nconst dailyPeakRevenueContributionPct =\n  report.revenue.gross_revenue > 0\n    ? percentageChange(\n        bestRevenueDay.gross_revenue,\n        0\n      )\n    : null;\n\n// Calculate peak revenue contribution separately.\nconst peakDayRevenueSharePct = round(\n  (bestRevenueDay.gross_revenue /\n    report.revenue.gross_revenue) * 100\n);\n\n// --------------------------------------------------\n// 3. BUILD BUSINESS FINDINGS\n// --------------------------------------------------\n\nconst findings = [\n  {\n    type: 'positive',\n    title: 'Highest-revenue month',\n    description:\n      `${formatMonth(bestRevenueMonth)} was the strongest complete month, ` +\n      `generating ${formatCurrency(bestRevenueMonth.gross_revenue)} in gross revenue.`\n  },\n  {\n    type: 'info',\n    title: 'Lowest-revenue month',\n    description:\n      `${formatMonth(lowestRevenueMonth)} recorded the lowest gross revenue ` +\n      `among complete months, at ${formatCurrency(lowestRevenueMonth.gross_revenue)}.`\n  },\n  {\n    type: 'neutral',\n    title: 'Monthly revenue trend',\n    description:\n      `Gross revenue changed by ${fullPeriodRevenueChangePct}% ` +\n      `between ${formatMonth(firstFullMonth)} and ${formatMonth(lastFullMonth)}.`\n  },\n  {\n    type: 'info',\n    title: 'Highest order-volume month',\n    description:\n      `${formatMonth(bestOrdersMonth)} recorded the highest number of ` +\n      `completed orders (${bestOrdersMonth.completed_orders.toLocaleString('en-GB')}).`\n  },\n  {\n    type: 'positive',\n    title: 'Highest daily revenue',\n    description:\n      `${formatDate(bestRevenueDay.sales_date)} was the strongest active ` +\n      `sales date, generating ${formatCurrency(bestRevenueDay.gross_revenue)}.`\n  },\n  {\n    type: 'neutral',\n    title: 'Average daily revenue',\n    description:\n      `Average gross revenue was ${formatCurrency(averageDailyGrossRevenue)} ` +\n      `per active transaction date across ${dailyMetrics.length} active dates.`\n  },\n  {\n    type: 'info',\n    title: 'Partial reporting month',\n    description:\n      `The final reporting month, ${report.data_quality.partial_month}, ` +\n      `contains incomplete monthly data and is excluded from full-month comparisons.`\n  }\n];\n\n// --------------------------------------------------\n// 4. STRUCTURED OUTPUT\n// --------------------------------------------------\n\nconst timeSeriesInsights = {\n  monthly: {\n    summary: {\n      total_months: monthlyMetrics.length,\n      complete_months: fullMonths.length,\n      partial_months: monthlyMetrics.length - fullMonths.length,\n\n      best_revenue_month: {\n        month: bestRevenueMonth.sales_month,\n        gross_revenue: round(bestRevenueMonth.gross_revenue)\n      },\n\n      lowest_revenue_month: {\n        month: lowestRevenueMonth.sales_month,\n        gross_revenue: round(lowestRevenueMonth.gross_revenue)\n      },\n\n      best_orders_month: {\n        month: bestOrdersMonth.sales_month,\n        completed_orders: bestOrdersMonth.completed_orders\n      },\n\n      first_complete_month: firstFullMonth.sales_month,\n      last_complete_month: lastFullMonth.sales_month,\n      full_period_revenue_change_pct: fullPeriodRevenueChangePct\n    },\n\n    metrics: monthlyTrend\n  },\n\n  daily: {\n    summary: {\n      active_transaction_dates: dailyMetrics.length,\n\n      total_gross_revenue: round(totalDailyGrossRevenue),\n\n      average_gross_revenue_per_active_date:\n        round(averageDailyGrossRevenue),\n\n      average_completed_orders_per_active_date:\n        round(averageDailyOrders),\n\n      peak_revenue_day: {\n        date: formatDate(bestRevenueDay.sales_date),\n        gross_revenue: round(bestRevenueDay.gross_revenue),\n        revenue_share_pct: peakDayRevenueSharePct\n      },\n\n      peak_orders_day: {\n        date: formatDate(bestOrdersDay.sales_date),\n        completed_orders: bestOrdersDay.completed_orders\n      }\n    }\n  },\n\n  findings\n  \n};\n\n// --------------------------------------------------\n// 5. VALIDATION\n// --------------------------------------------------\n\nconst validation = {\n  monthly_records_match:\n    monthlyMetrics.length === timeSeriesInsights.monthly.metrics.length,\n\n  partial_month_excluded_from_comparisons:\n    monthlyTrend\n      .filter((month) => month.is_partial_period)\n      .every((month) =>\n        month.calculated_gross_revenue_growth_pct === null\n      ),\n\n  daily_active_date_count_matches:\n    dailyMetrics.length === timeSeriesInsights.daily.summary.active_transaction_dates,\n\n  daily_revenue_reconciles:\n    round(totalDailyGrossRevenue) ===\n    round(report.revenue.gross_revenue),\n\n  daily_orders_are_non_negative:\n    dailyMetrics.every((day) => day.completed_orders >= 0)\n};\n\nreturn [{\n  json: {\n    ...input,\n\n    time_series_insights: {\n      ...timeSeriesInsights,\n      validation\n    }\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        -64
+      ],
+      "id": "10f7a00d-f076-4c8d-a727-4357e664822e",
+      "name": "Generate Time-Series Insights"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nif (items.length !== 1) {\n  throw new Error(\n    `Expected exactly 1 report item, received ${items.length}.`\n  );\n}\n\nconst input = items[0].json;\n\n// Define the validation checks expected from each insight node.\nconst requiredChecks = {\n  orders_insights: [\n    'completion_and_cancellation_counts_match',\n    'cancellation_rate_matches_stored'\n  ],\n\n  revenue_insights: [\n    'revenue_reconciles',\n    'transaction_lines_reconcile',\n    'revenue_percentages_reconcile'\n  ],\n\n  product_geography_insights: [\n    'product_revenue_leader_matches_ranking',\n    'product_quantity_leader_matches_ranking',\n    'top_10_product_revenue_not_exceeding_total',\n    'top_10_product_units_not_exceeding_total',\n    'top_10_country_gross_revenue_not_exceeding_total',\n    'top_10_country_net_revenue_not_exceeding_total'\n  ],\n\n  time_series_insights: [\n    'monthly_records_match',\n    'partial_month_excluded_from_comparisons',\n    'daily_active_date_count_matches',\n    'daily_revenue_reconciles',\n    'daily_orders_are_non_negative'\n  ]\n};\n\nconst sectionResults = {};\n\nfor (const [sectionName, expectedChecks] of Object.entries(requiredChecks)) {\n  const section = input[sectionName];\n\n  const sectionExists =\n    section !== null &&\n    typeof section === 'object' &&\n    !Array.isArray(section);\n\n  const summaryPaths = {\n  orders_insights: ['summary'],\n  revenue_insights: ['summary'],\n  product_geography_insights: [\n    'products.summary',\n    'geography.summary'\n  ],\n  time_series_insights: [\n    'monthly.summary',\n    'daily.summary'\n  ]\n};\n\nconst requiredSummaries = summaryPaths[sectionName];\n\nconst summaryChecks = requiredSummaries.map(path => {\n  const value = path.split('.').reduce(\n    (current, key) => current?.[key],\n    section\n  );\n\n  return {\n    path,\n    exists:\n      value !== null &&\n      typeof value === 'object' &&\n      !Array.isArray(value)\n  };\n});\n\nconst summaryExists = summaryChecks.every(check => check.exists);\n\n  const findingsExist =\n    sectionExists &&\n    Array.isArray(section.findings);\n\n  const validationExists =\n    sectionExists &&\n    section.validation !== null &&\n    typeof section.validation === 'object' &&\n    !Array.isArray(section.validation);\n\n  const validation = validationExists ? section.validation : {};\n\n  const missingChecks = expectedChecks.filter(\n    check => !Object.prototype.hasOwnProperty.call(validation, check)\n  );\n\n  const failedChecks = Object.entries(validation)\n    .filter(([, value]) => value !== true)\n    .map(([check]) => check);\n\n  const passedChecks = expectedChecks.filter(\n    check => validation[check] === true\n  );\n\n  const sectionPassed =\n    sectionExists &&\n    summaryExists &&\n    findingsExist &&\n    validationExists &&\n    missingChecks.length === 0 &&\n    failedChecks.length === 0;\n\n  sectionResults[sectionName] = {\n    passed: sectionPassed,\n    summary_exists: summaryExists,\n    findings_exist: findingsExist,\n    validation_exists: validationExists,\n    expected_checks: expectedChecks.length,\n    passed_checks: passedChecks.length,\n    missing_checks: missingChecks,\n    failed_checks: failedChecks,\n    summary_checks: summaryChecks\n  };\n}\n\nconst allSectionsPassed = Object.values(sectionResults)\n  .every(section => section.passed);\n\nconst totalExpectedChecks = Object.values(requiredChecks)\n  .reduce((total, checks) => total + checks.length, 0);\n\nconst totalPassedChecks = Object.values(sectionResults)\n  .reduce((total, section) => total + section.passed_checks, 0);\n\nconst finalValidation = {\n  passed: allSectionsPassed,\n  validated_at: new Date().toISOString(),\n  sections_checked: Object.keys(requiredChecks).length,\n  sections_passed: Object.values(sectionResults)\n    .filter(section => section.passed).length,\n  total_expected_checks: totalExpectedChecks,\n  total_passed_checks: totalPassedChecks,\n  sections: sectionResults\n};\n\nreturn [{\n  json: {\n    ...input,\n    final_validation: finalValidation\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        -64
+      ],
+      "id": "d060c31d-029c-4e59-8894-d642bce73116",
+      "name": "Validate All Insight Sections"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 4
+          },
+          "conditions": [
+            {
+              "id": "90a90889-03f9-4eb0-b527-2446f2f77fde",
+              "leftValue": "={{ $json.final_validation.passed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [
+        2016,
+        -64
+      ],
+      "id": "b6f701b7-662e-4780-9043-6b38ef0008de",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "errorMessage": "=={{   'ShopPulse report generation blocked. ' +  'Validation passed: ' +  $json.final_validation.total_passed_checks + '/' +  $json.final_validation.total_expected_checks +  '. Sections passed: ' +  $json.final_validation.sections_passed + '/' +  $json.final_validation.sections_checked +  '. Check final_validation.sections for details.'}}"
+      },
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        32
+      ],
+      "id": "544980ae-b1d1-4ff0-baa9-1f02bbd1f3c7",
+      "name": "Stop and Error"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nif (items.length !== 1) {\n  throw new Error(\n    `Expected exactly 1 report item, received ${items.length}.`\n  );\n}\n\nconst input = items[0].json;\n\n// Safety check: never assemble a report that failed validation.\nif (input.final_validation?.passed !== true) {\n  throw new Error(\n    'Report assembly blocked: final validation did not pass.'\n  );\n}\n\nconst reportData = input.report_data;\n\nif (!reportData) {\n  throw new Error('Prepared report data is missing.');\n}\n\n// Verify all four insight sections exist.\nconst requiredSections = [\n  'orders_insights',\n  'revenue_insights',\n  'product_geography_insights',\n  'time_series_insights'\n];\n\nfor (const sectionName of requiredSections) {\n  if (!input[sectionName]) {\n    throw new Error(`Missing report section: ${sectionName}`);\n  }\n}\n\n// Prepare report metadata.\nconst reportMetadata = {\n  report_id: reportData.report?.id ?? null,\n\n  generated_at: reportData.report?.generated_at ?? null,\n\n  project: reportData.report?.project ?? null,\n\n  source_dataset: reportData.report?.source_dataset ?? null,\n\n  dataset_scope: reportData.report?.dataset_scope ?? null,\n\n  currency: reportData.report?.currency ?? null,\n\n  period: reportData.report?.period ?? null\n};\n\n// Assemble the final report package.\nconst reportPackage = {\n  metadata: reportMetadata,\n\n  quality: {\n    status: 'passed',\n    validation: input.final_validation\n  },\n\n  sections: {\n    orders: input.orders_insights,\n\n    revenue: input.revenue_insights,\n\n    products_and_geography:\n      input.product_geography_insights,\n\n    time_series:\n      input.time_series_insights\n  }\n};\n\n// Return only the curated report package.\n// Intermediate processing data and the original payload\n// are intentionally excluded.\nreturn [{\n  json: {\n    report_package: reportPackage\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        -160
+      ],
+      "id": "fac1d13e-7c5a-4c78-ba55-7b61aa35d798",
+      "name": "Assemble Report Sections"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst items = $input.all();\n\nif (items.length !== 1) {\n  throw new Error(\n    `Build HTML Report expected exactly 1 item, received ${items.length}.`\n  );\n}\n\nconst pkg = items[0].json.report_package;\n\nif (!pkg) {\n  throw new Error('Missing report_package in input.');\n}\n\nif (pkg.quality?.status !== 'passed') {\n  throw new Error('Report quality gate has not passed.');\n}\n\nconst metadata = pkg.metadata ?? {};\nconst sections = pkg.sections ?? {};\nconst currency = metadata.currency || 'GBP';\n\n// --------------------------------------------------\n// 1. Formatting helpers\n// --------------------------------------------------\n\nconst escapeHtml = (value) => {\n  return String(value ?? '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;')\n    .replace(/'/g, '&#39;');\n};\n\nconst isMissing = (value) =>\n  value === null ||\n  value === undefined ||\n  value === '';\n\nconst number = (value, decimals = 0) => {\n  if (isMissing(value)) return 'N/A';\n\n  const numericValue = Number(value);\n\n  if (!Number.isFinite(numericValue)) return 'N/A';\n\n  return numericValue.toLocaleString('en-GB', {\n    minimumFractionDigits: decimals,\n    maximumFractionDigits: decimals\n  });\n};\n\nconst money = (value) => {\n  if (isMissing(value)) return 'N/A';\n\n  const numericValue = Number(value);\n\n  if (!Number.isFinite(numericValue)) return 'N/A';\n\n  return new Intl.NumberFormat('en-GB', {\n    style: 'currency',\n    currency,\n    minimumFractionDigits: 2,\n    maximumFractionDigits: 2\n  }).format(numericValue);\n};\n\nconst percentage = (value) => {\n  if (isMissing(value)) return 'N/A';\n\n  const numericValue = Number(value);\n\n  if (!Number.isFinite(numericValue)) return 'N/A';\n\n  return `${number(numericValue, 2)}%`;\n};\n\nconst formatDate = (value) => {\n  if (isMissing(value)) return 'N/A';\n\n  const date = new Date(value);\n\n  if (Number.isNaN(date.getTime())) {\n    return String(value);\n  }\n\n  return date.toLocaleDateString('en-GB', {\n    day: '2-digit',\n    month: 'short',\n    year: 'numeric',\n    timeZone: 'UTC'\n  });\n};\n\nconst formatDateTime = (value) => {\n  if (isMissing(value)) return 'N/A';\n\n  const date = new Date(value);\n\n  if (Number.isNaN(date.getTime())) {\n    return String(value);\n  }\n\n  return date.toLocaleString('en-GB', {\n    day: '2-digit',\n    month: 'short',\n    year: 'numeric',\n    hour: '2-digit',\n    minute: '2-digit',\n    timeZone: 'UTC'\n  });\n};\n\nconst formatKey = (key) =>\n  String(key)\n    .replace(/_/g, ' ')\n    .replace(/\\b\\w/g, (char) => char.toUpperCase());\n\nconst currencyKeys = [\n  'gross_revenue',\n  'net_revenue',\n  'cancellation_value',\n  'average_order_value',\n  'total_gross_revenue',\n  'average_gross_revenue_per_active_date',\n  'top_10_gross_revenue',\n  'top_10_net_revenue'\n];\n\nconst decimalKeys = [\n  'average_items_per_order',\n  'average_completed_orders_per_active_date'\n];\n\nconst formatSummaryValue = (key, value) => {\n  if (isMissing(value)) return 'N/A';\n\n  if (currencyKeys.includes(key)) {\n    return money(value);\n  }\n\n  if (key.endsWith('_pct')) {\n    return percentage(value);\n  }\n\n  if (decimalKeys.includes(key)) {\n    return number(value, 2);\n  }\n\n  if (typeof value === 'boolean') {\n    return value ? 'Yes' : 'No';\n  }\n\n  if (typeof value === 'number') {\n    return number(value);\n  }\n\n  return String(value);\n};\n\n// --------------------------------------------------\n// 2. Summary table renderer\n// --------------------------------------------------\n\nconst renderSummaryTable = (summary) => {\n  if (!summary || typeof summary !== 'object') {\n    return '<p class=\"muted\">No summary data available.</p>';\n  }\n\n  const rows = Object.entries(summary)\n    .filter(([, value]) =>\n      value === null ||\n      ['string', 'number', 'boolean'].includes(typeof value)\n    )\n    .map(([key, value]) => `\n      <tr>\n        <td>${escapeHtml(formatKey(key))}</td>\n        <td>${escapeHtml(formatSummaryValue(key, value))}</td>\n      </tr>\n    `)\n    .join('');\n\n  if (!rows) {\n    return '<p class=\"muted\">No summary metrics available.</p>';\n  }\n\n  return `\n    <table>\n      <thead>\n        <tr>\n          <th>Metric</th>\n          <th>Value</th>\n        </tr>\n      </thead>\n      <tbody>${rows}</tbody>\n    </table>\n  `;\n};\n\n// --------------------------------------------------\n// 3. Findings renderer\n// --------------------------------------------------\n\nconst renderFindings = (findings) => {\n  if (!Array.isArray(findings) || findings.length === 0) {\n    return '<p class=\"muted\">No findings available.</p>';\n  }\n\n  const listItems = findings.map((finding) => {\n    let text;\n\n    if (typeof finding === 'string') {\n      text = finding;\n    } else if (finding && typeof finding === 'object') {\n      text =\n        finding.message ??\n        finding.description ??\n        finding.finding ??\n        JSON.stringify(finding);\n    } else {\n      text = String(finding);\n    }\n\n    return `<li>${escapeHtml(text)}</li>`;\n  }).join('');\n\n  return `<ul class=\"findings\">${listItems}</ul>`;\n};\n\n// --------------------------------------------------\n// 4. Generic table renderer\n// --------------------------------------------------\n\nconst renderTable = (columns, rows, emptyMessage) => {\n  if (!Array.isArray(rows) || rows.length === 0) {\n    return `<p class=\"muted\">${escapeHtml(emptyMessage)}</p>`;\n  }\n\n  const header = columns.map((column) =>\n    `<th>${escapeHtml(column.label)}</th>`\n  ).join('');\n\n  const body = rows.map((row) => {\n    const cells = columns.map((column) => {\n      const value = column.render\n        ? column.render(row[column.key], row)\n        : row[column.key];\n\n      return `<td>${escapeHtml(value ?? 'N/A')}</td>`;\n    }).join('');\n\n    return `<tr>${cells}</tr>`;\n  }).join('');\n\n  return `\n    <div class=\"table-wrapper\">\n      <table>\n        <thead><tr>${header}</tr></thead>\n        <tbody>${body}</tbody>\n      </table>\n    </div>\n  `;\n};\n\n// --------------------------------------------------\n// 5. Extract report sections\n// --------------------------------------------------\n\nconst orders = sections.orders ?? {};\nconst revenue = sections.revenue ?? {};\nconst productGeo = sections.products_and_geography ?? {};\nconst products = productGeo.products ?? {};\nconst geography = productGeo.geography ?? {};\nconst timeSeries = sections.time_series ?? {};\nconst monthly = timeSeries.monthly ?? {};\nconst daily = timeSeries.daily ?? {};\n\nconst ordersSummary = orders.summary ?? {};\nconst revenueSummary = revenue.summary ?? {};\nconst productSummary = products.summary ?? {};\nconst geographySummary = geography.summary ?? {};\nconst monthlySummary = monthly.summary ?? {};\nconst dailySummary = daily.summary ?? {};\n\n// --------------------------------------------------\n// 6. KPI cards\n// --------------------------------------------------\n\nconst kpis = [\n  {\n    label: 'Net Revenue',\n    value: money(revenueSummary.net_revenue)\n  },\n  {\n    label: 'Gross Revenue',\n    value: money(revenueSummary.gross_revenue)\n  },\n  {\n    label: 'Completed Orders',\n    value: number(ordersSummary.completed_orders)\n  },\n  {\n    label: 'Cancellation Rate',\n    value: percentage(ordersSummary.cancellation_rate_pct)\n  },\n  {\n    label: 'Average Order Value',\n    value: money(ordersSummary.average_order_value)\n  },\n  {\n    label: 'Products Sold',\n    value: number(productSummary.distinct_products_sold)\n  }\n];\n\nconst kpiHtml = kpis.map((kpi) => `\n  <div class=\"kpi-card\">\n    <div class=\"kpi-label\">${escapeHtml(kpi.label)}</div>\n    <div class=\"kpi-value\">${escapeHtml(kpi.value)}</div>\n  </div>\n`).join('');\n\n// --------------------------------------------------\n// 7. Orders section\n// --------------------------------------------------\n\nconst ordersHtml = `\n  <section class=\"report-section\">\n    <h2>1. Orders Analysis</h2>\n\n    <h3>Order Summary</h3>\n    ${renderSummaryTable(ordersSummary)}\n\n    <h3>Key Findings</h3>\n    ${renderFindings(orders.findings)}\n  </section>\n`;\n\n// --------------------------------------------------\n// 8. Revenue section\n// --------------------------------------------------\n\nconst revenueHtml = `\n  <section class=\"report-section\">\n    <h2>2. Revenue Analysis</h2>\n\n    <h3>Revenue Summary</h3>\n    ${renderSummaryTable(revenueSummary)}\n\n    <h3>Key Findings</h3>\n    ${renderFindings(revenue.findings)}\n  </section>\n`;\n\n// --------------------------------------------------\n// 9. Products section\n// --------------------------------------------------\n\nconst topProductsByRevenue =\n  products.top_10_by_revenue ?? [];\n\nconst topProductsByQuantity =\n  products.top_10_by_quantity ?? [];\n\nconst productRevenueHtml = renderTable(\n  [\n    {\n      key: 'stock_code',\n      label: 'Stock Code'\n    },\n    {\n      key: 'product_name',\n      label: 'Product'\n    },\n    {\n      key: 'units_sold',\n      label: 'Units Sold',\n      render: (value) => number(value)\n    },\n    {\n      key: 'gross_revenue',\n      label: 'Gross Revenue',\n      render: (value) => money(value)\n    },\n    {\n      key: 'revenue_contribution_pct',\n      label: 'Revenue Contribution',\n      render: (value) => percentage(value)\n    }\n  ],\n  topProductsByRevenue,\n  'No product revenue ranking available.'\n);\n\nconst productQuantityHtml = renderTable(\n  [\n    {\n      key: 'stock_code',\n      label: 'Stock Code'\n    },\n    {\n      key: 'product_name',\n      label: 'Product'\n    },\n    {\n      key: 'units_sold',\n      label: 'Units Sold',\n      render: (value) => number(value)\n    },\n    {\n      key: 'gross_revenue',\n      label: 'Gross Revenue',\n      render: (value) => money(value)\n    }\n  ],\n  topProductsByQuantity,\n  'No product quantity ranking available.'\n);\n\n// --------------------------------------------------\n// 10. Geography section\n// --------------------------------------------------\n\nconst topCountries = geography.top_10_countries ?? [];\n\n// IMPORTANT:\n// Country records do not contain units_sold.\n// Therefore, this table does not display that column.\n\nconst countriesHtml = renderTable(\n  [\n    {\n      key: 'country',\n      label: 'Country'\n    },\n    {\n      key: 'gross_revenue',\n      label: 'Gross Revenue',\n      render: (value) => money(value)\n    },\n    {\n      key: 'net_revenue',\n      label: 'Net Revenue',\n      render: (value) => money(value)\n    },\n    {\n      key: 'completed_orders',\n      label: 'Completed Orders',\n      render: (value) => number(value)\n    },\n    {\n      key: 'revenue_contribution_pct',\n      label: 'Revenue Contribution',\n      render: (value) => percentage(value)\n    }\n  ],\n  topCountries,\n  'No country ranking available.'\n);\n\nconst productGeoHtml = `\n  <section class=\"report-section\">\n    <h2>3. Product & Geography Analysis</h2>\n\n    <h3>Product Summary</h3>\n    ${renderSummaryTable(productSummary)}\n\n    <h3>Top 10 Products by Revenue</h3>\n    ${productRevenueHtml}\n\n    <h3>Top 10 Products by Quantity</h3>\n    ${productQuantityHtml}\n\n    <h3>Geography Summary</h3>\n    ${renderSummaryTable(geographySummary)}\n\n    <h3>Top 10 Countries by Revenue</h3>\n    ${countriesHtml}\n\n    <h3>Key Findings</h3>\n    ${renderFindings(productGeo.findings)}\n  </section>\n`;\n\n// --------------------------------------------------\n// 11. Time-series section\n// --------------------------------------------------\n\nconst monthlyMetrics = monthly.metrics ?? [];\n\n// IMPORTANT:\n// Monthly records do not contain units_sold.\n// Revenue, orders, cancellation value and growth\n// are the available monthly metrics.\n\nconst monthlyHtml = renderTable(\n  [\n    {\n      key: 'sales_month',\n      label: 'Month',\n      render: (value) => formatDate(value)\n    },\n    {\n      key: 'gross_revenue',\n      label: 'Gross Revenue',\n      render: (value) => money(value)\n    },\n    {\n      key: 'net_revenue',\n      label: 'Net Revenue',\n      render: (value) => money(value)\n    },\n    {\n      key: 'completed_orders',\n      label: 'Completed Orders',\n      render: (value) => number(value)\n    },\n    {\n      key: 'cancellation_value',\n      label: 'Cancellation Value',\n      render: (value) => money(value)\n    },\n    {\n      key: 'calculated_gross_revenue_growth_pct',\n      label: 'Revenue Growth',\n      render: (value, row) => {\n        if (row.is_partial_period) return 'Partial period';\n\n        return percentage(value);\n      }\n    }\n  ],\n  monthlyMetrics,\n  'No monthly metrics available.'\n);\n\nconst timeSeriesHtml = `\n  <section class=\"report-section\">\n    <h2>4. Time-Series Analysis</h2>\n\n    <h3>Monthly Summary</h3>\n    ${renderSummaryTable(monthlySummary)}\n\n    <h3>Monthly Trends</h3>\n    ${monthlyHtml}\n\n    <h3>Daily Summary</h3>\n    ${renderSummaryTable(dailySummary)}\n\n    <h3>Key Findings</h3>\n    ${renderFindings(timeSeries.findings)}\n  </section>\n`;\n\n// --------------------------------------------------\n// 12. Quality section\n// --------------------------------------------------\n\nconst quality = pkg.quality ?? {};\nconst qualityValidation = quality.validation ?? {};\n\nconst qualityRows = [\n  {\n    label: 'Sections Checked',\n    value: number(qualityValidation.sections_checked)\n  },\n  {\n    label: 'Sections Passed',\n    value: number(qualityValidation.sections_passed)\n  },\n  {\n    label: 'Expected Checks',\n    value: number(qualityValidation.total_expected_checks)\n  },\n  {\n    label: 'Passed Checks',\n    value: number(qualityValidation.total_passed_checks)\n  }\n];\n\nconst qualityHtml = `\n  <section class=\"report-section quality-section\">\n    <h2>Report Quality Validation</h2>\n\n    <table>\n      <thead>\n        <tr>\n          <th>Validation Metric</th>\n          <th>Result</th>\n        </tr>\n      </thead>\n      <tbody>\n        ${qualityRows.map((row) => `\n          <tr>\n            <td>${escapeHtml(row.label)}</td>\n            <td>${escapeHtml(row.value)}</td>\n          </tr>\n        `).join('')}\n      </tbody>\n    </table>\n\n    <p class=\"quality-status\">\n      Quality Gate: ${escapeHtml(quality.status ?? 'N/A')}\n    </p>\n\n    <p>\n      Validated At:\n      ${escapeHtml(formatDateTime(qualityValidation.validated_at))} UTC\n    </p>\n  </section>\n`;\n\n// --------------------------------------------------\n// 13. Report metadata\n// --------------------------------------------------\n\nconst reportId = metadata.report_id ?? 'unknown';\n\nconst generatedAt = formatDateTime(metadata.generated_at);\n\nconst periodStart = formatDate(metadata.period?.start);\nconst periodEnd = formatDate(metadata.period?.end);\n\nconst filename =\n  `shoppulse_analytics_report_${String(reportId).replace(/[^a-zA-Z0-9_-]/g, '')}.html`;\n\n// --------------------------------------------------\n// 14. Complete HTML document\n// --------------------------------------------------\n\nconst html = `\n<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n\n  <title>ShopPulse Analytics Report</title>\n\n  <style>\n    * {\n      box-sizing: border-box;\n    }\n\n    body {\n      margin: 0;\n      padding: 32px;\n      background: #f3f4f6;\n      color: #1f2937;\n      font-family: Arial, Helvetica, sans-serif;\n      font-size: 13px;\n      line-height: 1.6;\n    }\n\n    .report-container {\n      max-width: 1100px;\n      margin: 0 auto;\n      padding: 36px;\n      background: #ffffff;\n      border-radius: 10px;\n    }\n\n    .report-header {\n      padding-bottom: 24px;\n      border-bottom: 2px solid #e5e7eb;\n      margin-bottom: 28px;\n    }\n\n    .report-header h1 {\n      margin: 0 0 8px;\n      color: #111827;\n      font-size: 30px;\n    }\n\n    .report-subtitle {\n      margin: 0;\n      color: #6b7280;\n      font-size: 14px;\n    }\n\n    .metadata {\n      display: grid;\n      grid-template-columns: repeat(2, minmax(0, 1fr));\n      gap: 10px 24px;\n      margin-top: 22px;\n    }\n\n    .metadata-item {\n      color: #4b5563;\n    }\n\n    .metadata-item strong {\n      color: #111827;\n    }\n\n    .kpi-grid {\n      display: grid;\n      grid-template-columns: repeat(3, minmax(0, 1fr));\n      gap: 14px;\n      margin: 28px 0;\n    }\n\n    .kpi-card {\n      padding: 18px;\n      border: 1px solid #e5e7eb;\n      border-radius: 8px;\n      background: #f9fafb;\n    }\n\n    .kpi-label {\n      margin-bottom: 8px;\n      color: #6b7280;\n      font-size: 12px;\n    }\n\n    .kpi-value {\n      color: #111827;\n      font-size: 21px;\n      font-weight: 700;\n      overflow-wrap: anywhere;\n    }\n\n    .report-section {\n      margin-top: 34px;\n      page-break-inside: auto;\n    }\n\n    .report-section h2 {\n      padding-bottom: 10px;\n      border-bottom: 1px solid #d1d5db;\n      color: #111827;\n      font-size: 21px;\n    }\n\n    .report-section h3 {\n      margin-top: 24px;\n      margin-bottom: 10px;\n      color: #374151;\n      font-size: 15px;\n    }\n\n    table {\n      width: 100%;\n      margin: 12px 0 22px;\n      border-collapse: collapse;\n      font-size: 12px;\n    }\n\n    th {\n      padding: 11px 10px;\n      background: #f3f4f6;\n      color: #374151;\n      text-align: left;\n      font-weight: 700;\n    }\n\n    td {\n      padding: 10px;\n      border-bottom: 1px solid #e5e7eb;\n      color: #374151;\n      vertical-align: top;\n    }\n\n    tr {\n      page-break-inside: avoid;\n    }\n\n    .table-wrapper {\n      width: 100%;\n      overflow-x: auto;\n    }\n\n    .findings {\n      padding-left: 22px;\n    }\n\n    .findings li {\n      margin-bottom: 9px;\n      color: #374151;\n    }\n\n    .muted {\n      color: #9ca3af;\n      font-style: italic;\n    }\n\n    .quality-section {\n      padding-top: 8px;\n    }\n\n    .quality-status {\n      margin-top: 16px;\n      font-weight: 700;\n    }\n\n    .report-footer {\n      margin-top: 40px;\n      padding-top: 18px;\n      border-top: 1px solid #e5e7eb;\n      color: #9ca3af;\n      font-size: 11px;\n      text-align: center;\n    }\n\n    @media print {\n      body {\n        padding: 0;\n        background: #ffffff;\n      }\n\n      .report-container {\n        max-width: none;\n        padding: 20px;\n        border-radius: 0;\n      }\n\n      .report-section {\n        page-break-inside: auto;\n      }\n\n      h2, h3 {\n        page-break-after: avoid;\n      }\n\n      table {\n        page-break-inside: auto;\n      }\n\n      tr {\n        page-break-inside: avoid;\n      }\n    }\n  </style>\n</head>\n\n<body>\n  <main class=\"report-container\">\n\n    <header class=\"report-header\">\n      <h1>ShopPulse Analytics Report</h1>\n\n      <p class=\"report-subtitle\">\n        Automated Sales Analytics Pipeline\n      </p>\n\n      <div class=\"metadata\">\n        <div class=\"metadata-item\">\n          <strong>Report ID:</strong>\n          ${escapeHtml(reportId)}\n        </div>\n\n        <div class=\"metadata-item\">\n          <strong>Generated At:</strong>\n          ${escapeHtml(generatedAt)} UTC\n        </div>\n\n        <div class=\"metadata-item\">\n          <strong>Source Dataset:</strong>\n          ${escapeHtml(metadata.source_dataset ?? 'N/A')}\n        </div>\n\n        <div class=\"metadata-item\">\n          <strong>Dataset Scope:</strong>\n          ${escapeHtml(metadata.dataset_scope ?? 'N/A')}\n        </div>\n\n        <div class=\"metadata-item\">\n          <strong>Reporting Period:</strong>\n          ${escapeHtml(periodStart)} – ${escapeHtml(periodEnd)}\n        </div>\n\n        <div class=\"metadata-item\">\n          <strong>Currency:</strong>\n          ${escapeHtml(currency)}\n        </div>\n      </div>\n    </header>\n\n    <section>\n      <h2>Executive Summary</h2>\n\n      <div class=\"kpi-grid\">\n        ${kpiHtml}\n      </div>\n    </section>\n\n    ${ordersHtml}\n\n    ${revenueHtml}\n\n    ${productGeoHtml}\n\n    ${timeSeriesHtml}\n\n    ${qualityHtml}\n\n    <footer class=\"report-footer\">\n      Generated automatically by the ShopPulse n8n analytics pipeline.\n      <br>\n      Report ID: ${escapeHtml(reportId)}\n    </footer>\n\n  </main>\n</body>\n</html>\n`;\n\n// --------------------------------------------------\n// 15. Return generated HTML\n// --------------------------------------------------\n\nreturn [\n  {\n    json: {\n      html,\n      filename,\n      report_id: reportId,\n      generated_at: metadata.generated_at ?? null,\n      content_type: 'text/html'\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        -160
+      ],
+      "id": "e303bba0-9c3d-4a03-8adc-40cc885bde39",
+      "name": "Build HTML Report"
+    },
+    {
+      "parameters": {
+        "operation": "toText",
+        "sourceProperty": "html",
+        "options": {
+          "fileName": "index.html"
+        }
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.2,
+      "position": [
+        2688,
+        -160
+      ],
+      "id": "7c145f62-f816-4460-ae4f-d67447e4687a",
+      "name": "Convert to File"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/reports/ShopPulse_Report_{{ $('Build HTML Report').first().json.report_id }}_{{ $now.toFormat('yyyyMMdd_HHmmss') }}.pdf",
+        "dataPropertyName": "pdf",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        3136,
+        -160
+      ],
+      "id": "18b9aca4-098b-4a60-a7bd-333dd68b2362",
+      "name": "Write PDF"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://gotenberg:3000/forms/chromium/convert/html",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "pdf"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2912,
+        -160
+      ],
+      "id": "4e69a291-2b5b-4b22-8bc9-9ff916434307",
+      "name": "Convert HTML to PDF"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO public.analytics_report_files AS existing (\n    report_id,\n    filename,\n    storage_path,\n    content_type,\n    file_size_bytes,\n    checksum_sha256\n)\nVALUES (\n    $1,\n    $2,\n    $3,\n    $4,\n    $5,\n    $6\n)\n\nON CONFLICT (storage_path)\n\nDO UPDATE SET\n    checksum_sha256 = EXCLUDED.checksum_sha256\n\nWHERE\n    existing.report_id = EXCLUDED.report_id\n\n    AND existing.filename = EXCLUDED.filename\n\n    AND existing.content_type = EXCLUDED.content_type\n\n    AND existing.file_size_bytes = EXCLUDED.file_size_bytes\n\n    AND (\n        existing.checksum_sha256 IS NULL\n        OR existing.checksum_sha256 = EXCLUDED.checksum_sha256\n    )\n\nRETURNING\n    report_file_id,\n    report_id,\n    filename,\n    storage_path,\n    content_type,\n    file_size_bytes,\n    checksum_sha256,\n    generated_at;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.report_id,\n  $json.filename,\n  $json.storage_path,\n  $json.content_type,\n  $json.file_size_bytes,\n  $json.checksum_sha256\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.8,
+      "position": [
+        4032,
+        -160
+      ],
+      "id": "77cdc29e-3ab7-4c1b-a425-9e448234cfc0",
+      "name": "Insert PDF Metadata",
+      "credentials": {
+        "postgres": {
+          "id": "mNB9SnoSMqKfNRbm",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\n// Retrieve the original analytics report.\nconst reportPackage = $('Assemble Report Sections')\n  .first()\n  .json\n  .report_package;\n\nconst reportId = Number(reportPackage?.metadata?.report_id);\n\nif (!Number.isSafeInteger(reportId) || reportId <= 0) {\n  throw new Error('Invalid or missing analytics report ID');\n}\n\nconst output = [];\n\nfor (let index = 0; index < items.length; index++) {\n  const item = items[index];\n\n  // Get the actual saved PDF path.\n  const storagePath = item.json?.fileName;\n\n  if (!storagePath || typeof storagePath !== 'string') {\n    throw new Error(`Missing PDF storage path at item ${index}`);\n  }\n\n  // Validate PDF binary.\n  if (!item.binary?.pdf) {\n    throw new Error(`Missing PDF binary at item ${index}`);\n  }\n\n  // Read actual binary contents to get exact size in bytes.\n  const pdfBuffer = await this.helpers.getBinaryDataBuffer(\n    index,\n    'pdf'\n  );\n\n  // Retrieve and validate SHA-256 checksum.\n  const checksum = item.json?.checksum_sha256;\n\n  if (\n    typeof checksum !== 'string' ||\n    !/^[a-f0-9]{64}$/i.test(checksum)\n  ) {\n    throw new Error(`Invalid SHA-256 checksum at item ${index}`);\n  }\n\n  const contentType = item.binary.pdf.mimeType;\n\n  if (contentType !== 'application/pdf') {\n    throw new Error(`Unexpected content type at item ${index}`);\n  }\n\n  output.push({\n    json: {\n      report_id: reportId,\n\n      filename: storagePath.split(/[\\\\/]/).pop(),\n\n      storage_path: storagePath,\n\n      content_type: contentType,\n\n      file_size_bytes: pdfBuffer.length,\n\n      checksum_sha256: checksum.toLowerCase()\n    },\n\n    pairedItem: {\n      item: index\n    }\n  });\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3808,
+        -160
+      ],
+      "id": "f1ad3643-473f-4d69-a152-b079198d32e8",
+      "name": "Prepare PDF Metadata"
+    },
+    {
+      "parameters": {
+        "binaryData": true,
+        "binaryPropertyName": "pdf",
+        "dataPropertyName": "checksum_sha256"
+      },
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        -240
+      ],
+      "id": "62c3a65e-2453-4c6d-b7a4-fcde371c9b8d",
+      "name": "Calculate  SHA-256"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        3584,
+        -160
+      ],
+      "id": "77426096-58aa-4a81-83a9-d75fef771a89",
+      "name": "Merge"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Get Latest Analytics Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Latest Analytics Report": {
+      "main": [
+        [
+          {
+            "node": "Validate Report Structure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Report Structure": {
+      "main": [
+        [
+          {
+            "node": "Prepare Report Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Report Data": {
+      "main": [
+        [
+          {
+            "node": "Generate Orders Insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Orders Insights": {
+      "main": [
+        [
+          {
+            "node": "Generate Revenue Insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Revenue Insights": {
+      "main": [
+        [
+          {
+            "node": "Generate Product & Geography Insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Product & Geography Insights": {
+      "main": [
+        [
+          {
+            "node": "Generate Time-Series Insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Time-Series Insights": {
+      "main": [
+        [
+          {
+            "node": "Validate All Insight Sections",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate All Insight Sections": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Assemble Report Sections",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop and Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Report Sections": {
+      "main": [
+        [
+          {
+            "node": "Build HTML Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build HTML Report": {
+      "main": [
+        [
+          {
+            "node": "Convert to File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert to File": {
+      "main": [
+        [
+          {
+            "node": "Convert HTML to PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert HTML to PDF": {
+      "main": [
+        [
+          {
+            "node": "Write PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write PDF": {
+      "main": [
+        [
+          {
+            "node": "Calculate  SHA-256",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Prepare PDF Metadata": {
+      "main": [
+        [
+          {
+            "node": "Insert PDF Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate  SHA-256": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Prepare PDF Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "d9a2a582-7633-42bc-82ac-87993f7d38d8",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "fbb7a1cbfc5f2bce585a9d1ef99ad3cf9ed9321ea46594f7ea295034e40dca00"
+  },
+  "nodeGroups": [],
+  "id": "6gjRGTDYtQashg2n",
+  "tags": []
+}
